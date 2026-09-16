@@ -52,6 +52,18 @@ API_KEY=...
 MODEL=your-reasoning-model
 ```
 
+Example: running against the MiniMax M3 reasoning endpoint:
+
+```text
+API_BASE_URL=https://api.minimax.cn/v1
+API_KEY=sk-...
+MODEL=MiniMax-M3
+REASONING_FIELD=reasoning_content
+TIMEOUT_SECONDS=1800
+```
+
+The cached `data/processed_*.jsonl` files shipped with this repo were produced with this exact setup.
+
 Optional fields (also overridable via YAML `model.*`; not exposed on CLI):
 
 ```text
@@ -293,6 +305,8 @@ If any source run returns an empty `reasoning`, the run aborts immediately — *
 
 ## 11. Reproduction notes
 
+> The cached `data/processed_samples.jsonl` (150 samples) and `data/processed_experiments.jsonl` (150 samples, 3 conditions: `first_pass` / `trace_append` / `trace_as_state`) shipped with this repo were produced with **MiniMax-M3** via `https://api.minimax.cn/v1`, `temperature=1.0`, `top_p=0.95`, `source_traces=5`, `second_pass_repeats=2`, `trace_max_chars=50_000`, seed `42`. To reproduce the same numbers end-to-end, point your `.env` at the same provider/model (see §2 example).
+
 1. **Same T for both placements.** Trace Append and Trace as State share the exact same `source_traces`; only the placement differs.
 2. **Random Trace donor must be a different problem.** The implementation uses a seed-driven cyclic permutation so the donor is always another sample in the same task. Don't swap it for a same-sample historical trace.
 3. **GraphWalks historical ground-truth bug.** Use the current Hugging Face revision, not the 2025 snapshot.
@@ -323,6 +337,9 @@ scripts/
   summarize_results.py
 tests/
   test_core.py      # unit tests for evaluator / prompts
+data/
+  processed_samples.jsonl     # Stage 1 cache: source runs + trace block
+  processed_experiments.jsonl # Stage 2 cache: per-condition results
 ```
 
 ---
@@ -334,3 +351,128 @@ pytest -q
 ```
 
 `tests/test_core.py` covers: `extract_final_answer` (normal / empty set), `score_set` (P/R/F1), `serialize_traces` (truncation), `split_graphwalks_prompt` (x/q split).
+
+---
+
+## 14. Output data schema
+
+`src.run` writes two JSONL files under `--output-dir` (default `data/`). Both are append-only and keyed by `md5(prompt)` so re-runs can resume from cache.
+
+### 14.1 `processed_samples.jsonl` (Stage 1)
+
+One record per sample, written right after the source runs finish. Schema:
+
+```json
+{
+  "md5": "e49fe902951b793fcfe133c40c16fc8b",
+  "sample": { /* GraphWalkSample asdict(): row_id, prompt, answer_nodes, prompt_chars, problem_type */ },
+  "runs": [
+    {
+      "repeat": 1,
+      "text": "Final Answer: [55b37c5c27]",
+      "answer_text": "Final Answer: [55b37c5c27]",
+      "reasoning": "The operation is to find the parents of ...",
+      "metrics": {
+        "em": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "prediction": ["55b37c5c27"],
+        "malformed": false
+      },
+      "elapsed_s": 11.94,
+      "usage": {
+        "total_tokens": 257325,
+        "prompt_tokens": 256938,
+        "completion_tokens": 387,
+        "completion_tokens_details": { "reasoning_tokens": 0 },
+        "prompt_tokens_details": { "cached_tokens": 0 }
+      }
+    }
+  ],
+  "block": "<TRACE_PREAMBLE>\n\n<trace_start>\n\n[Trace 1]\n...\n</trace_end>"
+}
+```
+
+Field notes:
+
+- `md5` — `md5(sample.prompt)`. The cache key.
+- `sample` — the original `GraphWalkSample` (graph text + `Operation:` block + `answer_nodes` + `prompt_chars`).
+- `runs` — `source_traces` independent first-pass calls. Each `repeat` carries:
+  - `text` — the model's visible answer text (the `Final Answer: [...]` line, possibly with surrounding output).
+  - `answer_text` — kept equal to `text`; preserved for `answer_feedback` condition assembly.
+  - `reasoning` — the raw CoT / chain-of-thought string returned by the model. **This is what gets stitched into `T` for downstream conditions.** Empty `reasoning` aborts the run.
+  - `metrics` — `extract_final_answer` + `score_set` result for this single repeat.
+  - `elapsed_s` — wall-clock seconds for the API call.
+  - `usage` — the endpoint's `usage` payload verbatim; useful for cost accounting.
+- `block` — the fully-serialised `T` (preamble + `<trace_start>` + `[Trace i]` blocks + `</trace_end>`), already truncated to `trace_max_chars` per trace. Stored so Stage 2 doesn't need to recompute.
+
+### 14.2 `processed_experiments.jsonl` (Stage 2)
+
+One record per sample, written after every condition finishes. Schema:
+
+```json
+{
+  "md5": "e49fe902951b793fcfe133c40c16fc8b",
+  "sample": { /* GraphWalkSample asdict() */ },
+  "result": {
+    "sample": { /* same shape as above */ },
+    "trace": {
+      "source_count": 5,
+      "max_chars": 50000,
+      "serialized_chars": 213044,
+      "source_trace_chars": [41820, 41510, 41100, 42033, 41802],
+      "block": "..."
+    },
+    "outputs": {
+      "first_pass":      { "repeats": [...], "mean_metrics": { "em":..., "precision":..., "recall":..., "f1":... } },
+      "trace_append":    { "repeats": [...], "mean_metrics": {...}, "prompt_chars": 447247 },
+      "trace_as_state":  { "repeats": [...], "mean_metrics": {...}, "prompt_chars": 213044 },
+      "re2":             { "repeats": [...], "mean_metrics": {...}, "prompt_chars": ... },
+      "question_first":  { ... },
+      "answer_feedback": { ... },
+      "random_trace":    { ... },
+      "trace_only":      { ... },
+      "majority_at5":    { "repeats": [{...}], "mean_metrics": {...}, "non_generation": true },
+      "oracle_at5":      { "repeats": [{...}], "mean_metrics": {...}, "non_generation": true }
+    },
+    "random_trace_donor_row_id": 1024
+  }
+}
+```
+
+Per-condition record shape:
+
+| Field                    | Meaning                                                                                                                                                                                                              |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `repeats`              | List of per-call records. Same schema as Stage-1 `runs[i]`: `repeat`, `text`, `reasoning`, `metrics`, `elapsed_s`, `usage`, `condition`. Empty `text`/`reasoning` for non-generation conditions. |
+| `mean_metrics`         | `mean(em/precision/recall/f1)` across `repeats`. The number to compare across conditions.                                                                                                                        |
+| `prompt_chars`         | Length of the prompt actually sent to the model for this condition. Useful for sanity-checking trace placement.                                                                                                      |
+| `non_generation`       | Only present for `first_pass`, `majority_at5`, `oracle_at5` — true means no second-pass LLM call was made.                                                                                                    |
+| `skipped` + `reason` | Only present if a condition could not run (e.g.`random_trace` with no donor available).                                                                                                                            |
+
+Top-level helpers:
+
+- `trace.source_count` — number of source traces stitched into `T` (= `len(runs)`).
+- `trace.max_chars` — per-trace character cap that was applied.
+- `trace.serialized_chars` — actual length of `block` after truncation.
+- `trace.source_trace_chars` — pre-truncation reasoning length per source run.
+- `random_trace_donor_row_id` — the `row_id` of the sample whose `T` was used for the `random_trace` condition (a different sample in the same `task`, picked by the `seed`-driven cyclic permutation). `null` if there was only one sample.
+
+### 14.3 Reading the data
+
+Quick peek:
+
+```bash
+head -n 1 data/processed_experiments.jsonl | python -m json.tool
+```
+
+Per-condition EM / P / R / F1 / n table:
+
+```bash
+python scripts/summarize_results.py --path data/processed_experiments.jsonl
+```
+
+The summariser also runs an F1-consistency guardrail (§8) and warns when a stored F1 disagrees with the P/R-derived value.
+
+To rerun a single sample, delete its `md5` row from both files; the next run will rebuild it from scratch.
