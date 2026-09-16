@@ -1,0 +1,28 @@
+dataset:
+  name: openai/graphwalks
+  split: train
+  task: parents
+
+experiment:
+  target_prompt_chars: 300000
+  bin_tolerance: 180000
+  max_samples: 150
+
+  source_traces: 5
+  second_pass_repeats: 2
+  trace_max_chars: 50000
+  seed: 42
+  conditions:
+    - first_pass
+    - trace_append
+    - trace_as_state
+
+model:
+  temperature: 1.0
+  top_p: 0.95
+  max_output_tokens: null
+  timeout_seconds: 1800
+  extra_body:
+    reasoning_split: true
+    thinking:
+      type: adaptive
